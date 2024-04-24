@@ -41,6 +41,10 @@ import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
+import com.google.common.util.concurrent.MoreExecutors;
+import static org.mockito.Mockito.doAnswer;
+
+
 
 @RunWith(JUnit4.class)
 public class AckBatchingSubscriberTest {
@@ -50,16 +54,15 @@ public class AckBatchingSubscriberTest {
   private CloudPubSubSubscriber subscriber;
 
   @Before
-  public void setUp() {
-    when(alarmFactory.newAlarm(any()))
-        .thenAnswer(
-            args -> {
-              onAlarm = args.getArgument(0);
-              return Futures.immediateVoidFuture();
-            });
+public void setUp() {
+    doAnswer(invocation -> {
+        onAlarm = invocation.getArgument(0);
+        return null;
+    }).when(alarmFactory).newAlarm(any());
+  
     subscriber = new AckBatchingSubscriber(underlying, alarmFactory);
     assertThat(onAlarm).isNotNull();
-  }
+}
 
   @Test
   public void pullProxies() {
