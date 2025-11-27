@@ -17,6 +17,43 @@ package com.google.pubsub.kafka.sink;
 
 import static com.google.pubsub.kafka.common.ConnectorUtils.getSystemExecutor;
 
+import java.io.BufferedWriter;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.nio.ByteBuffer;
+import java.text.SimpleDateFormat;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.connect.data.Field;
+import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.data.Schema.Type;
+import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.errors.DataException;
+import org.apache.kafka.connect.header.ConnectHeaders;
+import org.apache.kafka.connect.header.Header;
+import org.apache.kafka.connect.sink.SinkRecord;
+import org.apache.kafka.connect.sink.SinkTask;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.threeten.bp.Duration;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonMappingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.api.core.ApiFuture;
 import com.google.api.core.ApiFutures;
 import com.google.api.core.SettableApiFuture;
@@ -33,428 +70,536 @@ import com.google.pubsub.kafka.common.ConnectorUtils;
 import com.google.pubsub.kafka.sink.CloudPubSubSinkConnector.OrderingKeySource;
 import com.google.pubsub.v1.ProjectTopicName;
 import com.google.pubsub.v1.PubsubMessage;
-import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.concurrent.TimeUnit;
-import org.apache.kafka.clients.consumer.OffsetAndMetadata;
-import org.apache.kafka.common.TopicPartition;
-import org.apache.kafka.connect.data.Field;
-import org.apache.kafka.connect.data.Schema;
-import org.apache.kafka.connect.data.Schema.Type;
-import org.apache.kafka.connect.data.Struct;
-import org.apache.kafka.connect.errors.DataException;
-import org.apache.kafka.connect.header.ConnectHeaders;
-import org.apache.kafka.connect.header.Header;
-import org.apache.kafka.connect.sink.SinkRecord;
-import org.apache.kafka.connect.sink.SinkTask;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.threeten.bp.Duration;
 
 /**
  * A {@link SinkTask} used by a {@link CloudPubSubSinkConnector} to write messages to <a
  * href="https://cloud.google.com/pubsub">Google Cloud Pub/Sub</a>.
  */
 public class CloudPubSubSinkTask extends SinkTask {
-  private static final Logger log = LoggerFactory.getLogger(CloudPubSubSinkTask.class);
+    private static final Logger log = LoggerFactory.getLogger(CloudPubSubSinkTask.class);
 
-  // Maps a topic to another map which contains the outstanding futures per partition
-  private Map<String, Map<Integer, OutstandingFuturesForPartition>> allOutstandingFutures =
-      new HashMap<>();
-  private String cpsProject;
-  private String cpsTopic;
-  private String cpsEndpoint;
-  private String messageBodyName;
-  private long maxBufferSize;
-  private long maxBufferBytes;
-  private long maxOutstandingRequestBytes;
-  private long maxOutstandingMessages;
-  private int maxDelayThresholdMs;
-  private int maxRequestTimeoutMs;
-  private int maxTotalTimeoutMs;
-  private int maxShutdownTimeoutMs;
-  private boolean includeMetadata;
-  private boolean includeHeaders;
-  private OrderingKeySource orderingKeySource;
-  private boolean enableCompression;
-  private long compressionBytesThreshold;
-  private ConnectorCredentialsProvider gcpCredentialsProvider;
-  private com.google.cloud.pubsub.v1.Publisher publisher;
+    // Maps a topic to another map which contains the outstanding futures per partition
+    private Map<String, Map<Integer, OutstandingFuturesForPartition>> allOutstandingFutures =
+            new HashMap<>();
+    private String cpsProject;
+    private String cpsTopic;
+    private String cpsEndpoint;
+    private String messageBodyName;
+    private long maxBufferSize;
+    private long maxBufferBytes;
+    private long maxOutstandingRequestBytes;
+    private long maxOutstandingMessages;
+    private int maxDelayThresholdMs;
+    private int maxRequestTimeoutMs;
+    private int maxTotalTimeoutMs;
+    private int maxShutdownTimeoutMs;
+    private boolean includeMetadata;
+    private boolean includeHeaders;
+    private OrderingKeySource orderingKeySource;
+    private boolean enableCompression;
+    private long compressionBytesThreshold;
+    private ConnectorCredentialsProvider gcpCredentialsProvider;
+    private com.google.cloud.pubsub.v1.Publisher publisher;
 
-  /** Holds a list of the publishing futures that have not been processed for a single partition. */
-  private class OutstandingFuturesForPartition {
-    public List<ApiFuture<String>> futures = new ArrayList<>();
-  }
+    //** Introduced for Juniper Reconciliation **//
+    private String feedSequence;
+    private String kafkaReconFilePath;
+    private InetAddress ip;
+    private String kConnectHostname;
+    private String projectSequence;
+    private String kafkaConnSeq;
+    private String kafkaClusterId;
+    private boolean reconEnabled;
+    private Map<String, ArrayList<Reconciliation>> reconMaps = new HashMap<String, ArrayList<Reconciliation>>();
+    private ArrayList<Reconciliation> reconObjects = new ArrayList();
 
-  /**
-   * Holds a list of the unpublished messages for a single partition and the total size in bytes of
-   * the messages in the list.
-   */
-  private class UnpublishedMessagesForPartition {
-    public List<PubsubMessage> messages = new ArrayList<>();
-    public int size = 0;
-  }
-
-  public CloudPubSubSinkTask() {}
-
-  @VisibleForTesting
-  public CloudPubSubSinkTask(Publisher publisher) {
-    this.publisher = publisher;
-  }
-
-  @Override
-  public String version() {
-    return new CloudPubSubSinkConnector().version();
-  }
-
-  @Override
-  public void start(Map<String, String> props) {
-    Map<String, Object> validatedProps = new CloudPubSubSinkConnector().config().parse(props);
-    cpsProject = validatedProps.get(ConnectorUtils.CPS_PROJECT_CONFIG).toString();
-    cpsTopic = validatedProps.get(ConnectorUtils.CPS_TOPIC_CONFIG).toString();
-    cpsEndpoint = validatedProps.get(ConnectorUtils.CPS_ENDPOINT).toString();
-    maxBufferSize = (Integer) validatedProps.get(CloudPubSubSinkConnector.MAX_BUFFER_SIZE_CONFIG);
-    maxBufferBytes = (Long) validatedProps.get(CloudPubSubSinkConnector.MAX_BUFFER_BYTES_CONFIG);
-    maxOutstandingRequestBytes =
-        (Long) validatedProps.get(CloudPubSubSinkConnector.MAX_OUTSTANDING_REQUEST_BYTES);
-    maxOutstandingMessages =
-        (Long) validatedProps.get(CloudPubSubSinkConnector.MAX_OUTSTANDING_MESSAGES);
-    maxDelayThresholdMs =
-        (Integer) validatedProps.get(CloudPubSubSinkConnector.MAX_DELAY_THRESHOLD_MS);
-    maxRequestTimeoutMs =
-        (Integer) validatedProps.get(CloudPubSubSinkConnector.MAX_REQUEST_TIMEOUT_MS);
-    maxTotalTimeoutMs = (Integer) validatedProps.get(CloudPubSubSinkConnector.MAX_TOTAL_TIMEOUT_MS);
-    maxShutdownTimeoutMs =
-        (Integer) validatedProps.get(CloudPubSubSinkConnector.MAX_SHUTDOWN_TIMEOUT_MS);
-    messageBodyName = (String) validatedProps.get(CloudPubSubSinkConnector.CPS_MESSAGE_BODY_NAME);
-    includeMetadata = (Boolean) validatedProps.get(CloudPubSubSinkConnector.PUBLISH_KAFKA_METADATA);
-    includeHeaders = (Boolean) validatedProps.get(CloudPubSubSinkConnector.PUBLISH_KAFKA_HEADERS);
-    orderingKeySource =
-        OrderingKeySource.getEnum(
-            (String) validatedProps.get(CloudPubSubSinkConnector.ORDERING_KEY_SOURCE));
-    enableCompression = (Boolean) validatedProps.get(CloudPubSubSinkConnector.ENABLE_COMPRESSION);
-    compressionBytesThreshold =
-        (Long) validatedProps.get(CloudPubSubSinkConnector.COMPRESSION_BYTES_THRESHOLD);
-    gcpCredentialsProvider = ConnectorCredentialsProvider.fromConfig(validatedProps);
-    if (publisher == null) {
-      // Only do this if we did not use the constructor.
-      createPublisher();
+    /** Holds a list of the publishing futures that have not been processed for a single partition. */
+    private class OutstandingFuturesForPartition {
+        public List<ApiFuture<String>> futures = new ArrayList<>();
     }
-    log.info("Start CloudPubSubSinkTask");
-  }
 
-  @Override
-  public void put(Collection<SinkRecord> sinkRecords) {
-    log.debug("Received " + sinkRecords.size() + " messages to send to CPS.");
-    for (SinkRecord record : sinkRecords) {
-      log.trace("Received record: " + record.toString());
-      Map<String, String> attributes = new HashMap<>();
-      ByteString value = handleValue(record.valueSchema(), record.value(), attributes);
-      String key = null;
-      String partition = record.kafkaPartition().toString();
-      if (record.key() != null) {
-        key = record.key().toString();
-        attributes.put(ConnectorUtils.CPS_MESSAGE_KEY_ATTRIBUTE, key);
-      }
-      if (includeMetadata) {
-        attributes.put(ConnectorUtils.KAFKA_TOPIC_ATTRIBUTE, record.topic());
-        attributes.put(ConnectorUtils.KAFKA_PARTITION_ATTRIBUTE, partition);
-        attributes.put(ConnectorUtils.KAFKA_OFFSET_ATTRIBUTE, Long.toString(record.kafkaOffset()));
-        if (record.timestamp() != null) {
-          attributes.put(ConnectorUtils.KAFKA_TIMESTAMP_ATTRIBUTE, record.timestamp().toString());
-        }
-      }
-      if (includeHeaders) {
-        for (Header header : getRecordHeaders(record)) {
-          attributes.put(header.key(), header.value().toString());
-        }
-      }
-      if (attributes.size() == 0 && value == null) {
-        log.warn("Message received with no value and no attributes. Not publishing message");
-        SettableApiFuture<String> nullMessageFuture = SettableApiFuture.<String>create();
-        nullMessageFuture.set("No message");
-        addPendingMessageFuture(record.topic(), record.kafkaPartition(), nullMessageFuture);
-        continue;
-      }
-      PubsubMessage.Builder builder = PubsubMessage.newBuilder();
-      builder.putAllAttributes(attributes);
-      if (value != null) {
-        builder.setData(value);
-      }
-      if (orderingKeySource == OrderingKeySource.KEY && key != null && !key.isEmpty()) {
-        builder.setOrderingKey(key);
-      } else if (orderingKeySource == OrderingKeySource.PARTITION) {
-        builder.setOrderingKey(partition);
-      }
-
-      PubsubMessage message = builder.build();
-      publishMessage(record.topic(), record.kafkaPartition(), message);
+    /**
+     * Holds a list of the unpublished messages for a single partition and the total size in bytes of
+     * the messages in the list.
+     */
+    private class UnpublishedMessagesForPartition {
+        public List<PubsubMessage> messages = new ArrayList<>();
+        public int size = 0;
     }
-  }
 
-  private Iterable<? extends Header> getRecordHeaders(SinkRecord record) {
-    ConnectHeaders headers = new ConnectHeaders();
-    if (record.headers() != null) {
-      int headerCount = 0;
-      for (Header header : record.headers()) {
-        if (header.key().getBytes().length < 257
-            && String.valueOf(header.value()).getBytes().length < 1025) {
-          headers.add(header);
-          headerCount++;
-        }
-        if (headerCount > 100) {
-          break;
-        }
-      }
-    }
-    return headers;
-  }
+    public CloudPubSubSinkTask() {}
 
-  private ByteString handleValue(Schema schema, Object value, Map<String, String> attributes) {
-    if (value == null) {
-      return null;
+    @VisibleForTesting
+    public CloudPubSubSinkTask(Publisher publisher) {
+        this.publisher = publisher;
     }
-    if (schema == null) {
-      String str = value.toString();
-      return ByteString.copyFromUtf8(str);
-    }
-    Schema.Type t = schema.type();
-    switch (t) {
-      case INT8:
-        byte b = (Byte) value;
-        byte[] arr = {b};
-        return ByteString.copyFrom(arr);
-      case INT16:
-        ByteBuffer shortBuf = ByteBuffer.allocate(2);
-        shortBuf.putShort((Short) value);
-        return ByteString.copyFrom(shortBuf);
-      case INT32:
-        ByteBuffer intBuf = ByteBuffer.allocate(4);
-        intBuf.putInt((Integer) value);
-        return ByteString.copyFrom(intBuf);
-      case INT64:
-        ByteBuffer longBuf = ByteBuffer.allocate(8);
-        longBuf.putLong((Long) value);
-        return ByteString.copyFrom(longBuf);
-      case FLOAT32:
-        ByteBuffer floatBuf = ByteBuffer.allocate(4);
-        floatBuf.putFloat((Float) value);
-        return ByteString.copyFrom(floatBuf);
-      case FLOAT64:
-        ByteBuffer doubleBuf = ByteBuffer.allocate(8);
-        doubleBuf.putDouble((Double) value);
-        return ByteString.copyFrom(doubleBuf);
-      case BOOLEAN:
-        byte bool = (byte) ((Boolean) value ? 1 : 0);
-        byte[] boolArr = {bool};
-        return ByteString.copyFrom(boolArr);
-      case STRING:
-        String str = (String) value;
-        return ByteString.copyFromUtf8(str);
-      case BYTES:
-        if (value instanceof ByteString) {
-          return (ByteString) value;
-        } else if (value instanceof byte[]) {
-          return ByteString.copyFrom((byte[]) value);
-        } else if (value instanceof ByteBuffer) {
-          return ByteString.copyFrom((ByteBuffer) value);
-        } else {
-          throw new DataException("Unexpected value class with BYTES schema type.");
-        }
-      case STRUCT:
-        Struct struct = (Struct) value;
-        ByteString msgBody = null;
-        for (Field f : schema.fields()) {
-          Schema.Type fieldType = f.schema().type();
-          if (fieldType == Type.MAP || fieldType == Type.STRUCT) {
-            throw new DataException(
-                "Struct type does not support nested Map or Struct types, "
-                    + "present in field "
-                    + f.name());
-          }
 
-          Object val = struct.get(f);
-          if (val == null) {
-            if (!f.schema().isOptional()) {
-              throw new DataException("Struct message missing required field " + f.name());
-            } else {
-              continue;
+    @Override
+    public String version() {
+        return new CloudPubSubSinkConnector().version();
+    }
+
+    @Override
+    public void start(Map<String, String> props) {
+        Map<String, Object> validatedProps = new CloudPubSubSinkConnector().config().parse(props);
+        cpsProject = validatedProps.get(ConnectorUtils.CPS_PROJECT_CONFIG).toString();
+        cpsTopic = validatedProps.get(ConnectorUtils.CPS_TOPIC_CONFIG).toString();
+        cpsEndpoint = validatedProps.get(ConnectorUtils.CPS_ENDPOINT).toString();
+        feedSequence = props.get(ConnectorUtils.FEED_SEQUENCE);
+        kafkaReconFilePath = props.get(ConnectorUtils.RECON_FILE_PATH);
+        projectSequence = props.get(ConnectorUtils.PROJECT_SEQUENCE);
+        kafkaConnSeq = props.get(ConnectorUtils.KAFKACONN_SEQUENCE);
+        kafkaClusterId = props.get(ConnectorUtils.KAFKACLUSTER_ID);
+
+        try {
+            this.ip = InetAddress.getLocalHost();
+            this.kConnectHostname = this.ip.getHostName();
+        }
+        catch (UnknownHostException e) {
+            e.printStackTrace();
+        }
+        maxBufferSize = (Integer) validatedProps.get(CloudPubSubSinkConnector.MAX_BUFFER_SIZE_CONFIG);
+        maxBufferBytes = (Long) validatedProps.get(CloudPubSubSinkConnector.MAX_BUFFER_BYTES_CONFIG);
+        maxOutstandingRequestBytes =
+                (Long) validatedProps.get(CloudPubSubSinkConnector.MAX_OUTSTANDING_REQUEST_BYTES);
+        maxOutstandingMessages =
+                (Long) validatedProps.get(CloudPubSubSinkConnector.MAX_OUTSTANDING_MESSAGES);
+        maxDelayThresholdMs =
+                (Integer) validatedProps.get(CloudPubSubSinkConnector.MAX_DELAY_THRESHOLD_MS);
+        maxRequestTimeoutMs =
+                (Integer) validatedProps.get(CloudPubSubSinkConnector.MAX_REQUEST_TIMEOUT_MS);
+        maxTotalTimeoutMs = (Integer) validatedProps.get(CloudPubSubSinkConnector.MAX_TOTAL_TIMEOUT_MS);
+        maxShutdownTimeoutMs =
+                (Integer) validatedProps.get(CloudPubSubSinkConnector.MAX_SHUTDOWN_TIMEOUT_MS);
+        messageBodyName = (String) validatedProps.get(CloudPubSubSinkConnector.CPS_MESSAGE_BODY_NAME);
+        includeMetadata = (Boolean) validatedProps.get(CloudPubSubSinkConnector.PUBLISH_KAFKA_METADATA);
+        includeHeaders = (Boolean) validatedProps.get(CloudPubSubSinkConnector.PUBLISH_KAFKA_HEADERS);
+        orderingKeySource =
+                OrderingKeySource.getEnum(
+                        (String) validatedProps.get(CloudPubSubSinkConnector.ORDERING_KEY_SOURCE));
+        enableCompression = (Boolean) validatedProps.get(CloudPubSubSinkConnector.ENABLE_COMPRESSION);
+        compressionBytesThreshold =
+                (Long) validatedProps.get(CloudPubSubSinkConnector.COMPRESSION_BYTES_THRESHOLD);
+        gcpCredentialsProvider = ConnectorCredentialsProvider.fromConfig(validatedProps);
+        reconEnabled = Boolean.valueOf(validatedProps.get(ConnectorUtils.RECON_ENABLED).toString());
+        if (publisher == null) {
+            // Only do this if we did not use the constructor.
+            createPublisher();
+        }
+        log.info("Start CloudPubSubSinkTask");
+    }
+
+    @Override
+    public void put(Collection<SinkRecord> sinkRecords) {
+        log.debug("Received " + sinkRecords.size() + " messages to send to CPS.");
+        for (SinkRecord record : sinkRecords) {
+            log.trace("Received record: " + record.toString());
+            Map<String, String> attributes = new HashMap<>();
+            Reconciliation reconObject = null;
+
+            //*** Timestamp validation to fail the connector for records with null timestamp ***/
+            if(record.timestamp()==null) {
+                log.error("Timestamp not available for the record with topic: {} & partition: {} & Offset: {}", record.topic().toString(), record.kafkaPartition(), record.kafkaOffset());
+                throw new RuntimeException(String.format("Timestamp not available for the record with topic: %s & partition: %d & Offset: %d", record.topic().toString(), record.kafkaPartition(), record.kafkaOffset()));
             }
-          }
-          if (f.name().equals(messageBodyName)) {
-            Schema bodySchema = f.schema();
-            msgBody = handleValue(bodySchema, val, null);
-          } else {
-            attributes.put(f.name(), val.toString());
-          }
+
+            //***  Introduced for Juniper Reconciliation ***//
+            if (reconEnabled) {
+                log.trace("Recon enabled");
+                reconObject = new Reconciliation();
+                if (record.value() != null && !record.value().toString().isEmpty()) {
+                    try {
+                        JsonNode node = new ObjectMapper().readValue(record.value().toString(), JsonNode.class);
+                        if (node.get("message") != null) {
+                            if (node.get("message").get("headers") != null) {
+                                JsonNode header = node.get("message").get("headers");
+                                reconObject.setChangeSequence(header.get("changeSequence").asText());
+                                reconObject.setTransactionId(header.get("transactionId").asText());
+                                reconObject.setStreamPos(header.get("streamPosition").asText());
+                            }
+                        } else if (node.get("REC_TIMESTAMP") != null) {
+                            reconObject.setChangeSequence(node.get("REC_TIMESTAMP").asText().trim());
+                        }
+                    }catch (JsonMappingException e) {
+                        // Ignore as the message is not a JSON message and will be processed as String
+                    }catch (JsonProcessingException e) {
+                        // Ignore as the message is not a JSON message and will be processed as String
+                    }
+                }
+                reconObject.setKafka_topic(record.topic().toString());
+                reconObject.setKafka_partition(record.kafkaPartition().toString());
+                reconObject.setKafkaoffset(Long.toString(record.kafkaOffset()));
+                reconObject.setKafkaTimeStamp(record.timestamp().toString());
+            }
+
+            ByteString value = handleValue(record.valueSchema(), record.value(), attributes);
+            String key = null;
+            String partition = record.kafkaPartition().toString();
+            if (record.key() != null) {
+                key = record.key().toString();
+                attributes.put(ConnectorUtils.CPS_MESSAGE_KEY_ATTRIBUTE, key);
+            }
+            if (includeMetadata) {
+                attributes.put(ConnectorUtils.KAFKA_TOPIC_ATTRIBUTE, record.topic());
+                attributes.put(ConnectorUtils.KAFKA_PARTITION_ATTRIBUTE, partition);
+                attributes.put(ConnectorUtils.KAFKA_OFFSET_ATTRIBUTE, Long.toString(record.kafkaOffset()));
+                attributes.put(ConnectorUtils.KAFKA_TIMESTAMP_ATTRIBUTE, record.timestamp().toString());
+            }
+            if (includeHeaders) {
+                for (Header header : getRecordHeaders(record)) {
+                    attributes.put(header.key(), header.value().toString());
+                }
+            }
+            if (attributes.size() == 0 && value == null) {
+                log.warn("Message received with no value and no attributes. Not publishing message");
+                SettableApiFuture<String> nullMessageFuture = SettableApiFuture.<String>create();
+                nullMessageFuture.set("No message");
+                addPendingMessageFuture(record.topic(), record.kafkaPartition(), nullMessageFuture);
+                continue;
+            }
+            PubsubMessage.Builder builder = PubsubMessage.newBuilder();
+            builder.putAllAttributes(attributes);
+            if (value != null) {
+                builder.setData(value);
+            }
+            if (orderingKeySource == OrderingKeySource.KEY && key != null && !key.isEmpty()) {
+                builder.setOrderingKey(key);
+            } else if (orderingKeySource == OrderingKeySource.PARTITION) {
+                builder.setOrderingKey(partition);
+            }
+
+            PubsubMessage message = builder.build();
+            publishMessage(record.topic(), record.kafkaPartition(), message);
+            if (reconEnabled) {
+                reconObject.setPublishTimeStamp(String.valueOf(Instant.now().toEpochMilli()));
+                reconObjects.add(reconObject);
+            }
         }
-        if (msgBody != null) {
-          return msgBody;
-        } else {
-          return ByteString.EMPTY;
+
+        /**  Introduced for Juniper Reconciliation **/
+        if(reconEnabled) {
+            Iterator<Reconciliation> itr = reconObjects.iterator();
+            while (itr.hasNext()) {
+                Reconciliation reconObj = itr.next();
+                if (!reconMaps.containsKey(reconObj.getKafka_topic() + "^^" + reconObj.getKafka_partition())) {
+                    ArrayList<Reconciliation> list = new ArrayList<Reconciliation>();
+                    list.add(reconObj);
+                    reconMaps.put(reconObj.getKafka_topic() + "^^" + reconObj.getKafka_partition(), list);
+                } else {
+                    reconMaps.get(reconObj.getKafka_topic() + "^^" + reconObj.getKafka_partition()).add(reconObj);
+                }
+                itr.remove();
+            }
         }
-      case MAP:
-        Map<Object, Object> map = (Map<Object, Object>) value;
-        Set<Object> keys = map.keySet();
-        ByteString mapBody = null;
-        for (Object key : keys) {
-          if (key.equals(messageBodyName)) {
-            mapBody = ByteString.copyFromUtf8(map.get(key).toString());
-          } else {
-            attributes.put(key.toString(), map.get(key).toString());
-          }
+    }
+
+    private Iterable<? extends Header> getRecordHeaders(SinkRecord record) {
+        ConnectHeaders headers = new ConnectHeaders();
+        if (record.headers() != null) {
+            int headerCount = 0;
+            for (Header header : record.headers()) {
+                if (header.key().getBytes().length < 257
+                        && String.valueOf(header.value()).getBytes().length < 1025) {
+                    headers.add(header);
+                    headerCount++;
+                }
+                if (headerCount > 100) {
+                    break;
+                }
+            }
         }
-        if (mapBody != null) {
-          return mapBody;
-        } else {
-          return ByteString.EMPTY;
+        return headers;
+    }
+
+    private ByteString handleValue(Schema schema, Object value, Map<String, String> attributes) {
+        if (value == null) {
+            return null;
         }
-      case ARRAY:
-        Schema.Type arrType = schema.valueSchema().type();
-        if (arrType == Type.MAP || arrType == Type.STRUCT) {
-          throw new DataException("Array type does not support Map or Struct types.");
+        if (schema == null) {
+            String str = value.toString();
+            return ByteString.copyFromUtf8(str);
         }
-        ByteString out = ByteString.EMPTY;
-        Object[] objArr = (Object[]) value;
-        for (Object o : objArr) {
-          out = out.concat(handleValue(schema.valueSchema(), o, null));
+        Schema.Type t = schema.type();
+        switch (t) {
+            case INT8:
+                byte b = (Byte) value;
+                byte[] arr = {b};
+                return ByteString.copyFrom(arr);
+            case INT16:
+                ByteBuffer shortBuf = ByteBuffer.allocate(2);
+                shortBuf.putShort((Short) value);
+                return ByteString.copyFrom(shortBuf);
+            case INT32:
+                ByteBuffer intBuf = ByteBuffer.allocate(4);
+                intBuf.putInt((Integer) value);
+                return ByteString.copyFrom(intBuf);
+            case INT64:
+                ByteBuffer longBuf = ByteBuffer.allocate(8);
+                longBuf.putLong((Long) value);
+                return ByteString.copyFrom(longBuf);
+            case FLOAT32:
+                ByteBuffer floatBuf = ByteBuffer.allocate(4);
+                floatBuf.putFloat((Float) value);
+                return ByteString.copyFrom(floatBuf);
+            case FLOAT64:
+                ByteBuffer doubleBuf = ByteBuffer.allocate(8);
+                doubleBuf.putDouble((Double) value);
+                return ByteString.copyFrom(doubleBuf);
+            case BOOLEAN:
+                byte bool = (byte) ((Boolean) value ? 1 : 0);
+                byte[] boolArr = {bool};
+                return ByteString.copyFrom(boolArr);
+            case STRING:
+                String str = (String) value;
+                return ByteString.copyFromUtf8(str);
+            case BYTES:
+                if (value instanceof ByteString) {
+                    return (ByteString) value;
+                } else if (value instanceof byte[]) {
+                    return ByteString.copyFrom((byte[]) value);
+                } else if (value instanceof ByteBuffer) {
+                    return ByteString.copyFrom((ByteBuffer) value);
+                } else {
+                    throw new DataException("Unexpected value class with BYTES schema type.");
+                }
+            case STRUCT:
+                Struct struct = (Struct) value;
+                ByteString msgBody = null;
+                for (Field f : schema.fields()) {
+                    Schema.Type fieldType = f.schema().type();
+                    if (fieldType == Type.MAP || fieldType == Type.STRUCT) {
+                        throw new DataException(
+                                "Struct type does not support nested Map or Struct types, "
+                                        + "present in field "
+                                        + f.name());
+                    }
+
+                    Object val = struct.get(f);
+                    if (val == null) {
+                        if (!f.schema().isOptional()) {
+                            throw new DataException("Struct message missing required field " + f.name());
+                        } else {
+                            continue;
+                        }
+                    }
+                    if (f.name().equals(messageBodyName)) {
+                        Schema bodySchema = f.schema();
+                        msgBody = handleValue(bodySchema, val, null);
+                    } else {
+                        attributes.put(f.name(), val.toString());
+                    }
+                }
+                if (msgBody != null) {
+                    return msgBody;
+                } else {
+                    return ByteString.EMPTY;
+                }
+            case MAP:
+                Map<Object, Object> map = (Map<Object, Object>) value;
+                Set<Object> keys = map.keySet();
+                ByteString mapBody = null;
+                for (Object key : keys) {
+                    if (key.equals(messageBodyName)) {
+                        mapBody = ByteString.copyFromUtf8(map.get(key).toString());
+                    } else {
+                        attributes.put(key.toString(), map.get(key).toString());
+                    }
+                }
+                if (mapBody != null) {
+                    return mapBody;
+                } else {
+                    return ByteString.EMPTY;
+                }
+            case ARRAY:
+                Schema.Type arrType = schema.valueSchema().type();
+                if (arrType == Type.MAP || arrType == Type.STRUCT) {
+                    throw new DataException("Array type does not support Map or Struct types.");
+                }
+                ByteString out = ByteString.EMPTY;
+                Object[] objArr = (Object[]) value;
+                for (Object o : objArr) {
+                    out = out.concat(handleValue(schema.valueSchema(), o, null));
+                }
+                return out;
         }
-        return out;
-    }
-    return ByteString.EMPTY;
-  }
-
-  @Override
-  public void flush(Map<TopicPartition, OffsetAndMetadata> partitionOffsets) {
-    log.debug("Flushing...");
-    // Process results of all the outstanding futures specified by each TopicPartition.
-    for (Map.Entry<TopicPartition, OffsetAndMetadata> partitionOffset :
-        partitionOffsets.entrySet()) {
-      log.trace("Received flush for partition " + partitionOffset.getKey().toString());
-      Map<Integer, OutstandingFuturesForPartition> outstandingFuturesForTopic =
-          allOutstandingFutures.get(partitionOffset.getKey().topic());
-      if (outstandingFuturesForTopic == null) {
-        continue;
-      }
-      OutstandingFuturesForPartition outstandingFutures =
-          outstandingFuturesForTopic.get(partitionOffset.getKey().partition());
-      if (outstandingFutures == null) {
-        continue;
-      }
-      try {
-        ApiFutures.allAsList(outstandingFutures.futures).get();
-      } catch (Exception e) {
-        throw new RuntimeException(e);
-      } finally {
-        outstandingFutures.futures.clear();
-      }
-    }
-    allOutstandingFutures.clear();
-  }
-
-  /** Publish all the messages in a partition and store the Future's for each publish request. */
-  private void publishMessage(String topic, Integer partition, PubsubMessage message) {
-    addPendingMessageFuture(topic, partition, publisher.publish(message));
-  }
-
-  private void addPendingMessageFuture(String topic, Integer partition, ApiFuture<String> future) {
-    // Get a map containing all futures per partition for the passed in topic.
-    Map<Integer, OutstandingFuturesForPartition> outstandingFuturesForTopic =
-        allOutstandingFutures.get(topic);
-    if (outstandingFuturesForTopic == null) {
-      outstandingFuturesForTopic = new HashMap<>();
-      allOutstandingFutures.put(topic, outstandingFuturesForTopic);
-    }
-    // Get the object containing the outstanding futures for this topic and partition..
-    OutstandingFuturesForPartition outstandingFutures = outstandingFuturesForTopic.get(partition);
-    if (outstandingFutures == null) {
-      outstandingFutures = new OutstandingFuturesForPartition();
-      outstandingFuturesForTopic.put(partition, outstandingFutures);
-    }
-    outstandingFutures.futures.add(future);
-  }
-
-  private void createPublisher() {
-    ProjectTopicName fullTopic = ProjectTopicName.of(cpsProject, cpsTopic);
-
-    BatchingSettings.Builder batchingSettings =
-        BatchingSettings.newBuilder()
-            .setDelayThreshold(Duration.ofMillis(maxDelayThresholdMs))
-            .setElementCountThreshold(maxBufferSize)
-            .setRequestByteThreshold(maxBufferBytes);
-
-    if (useFlowControl()) {
-      batchingSettings.setFlowControlSettings(
-          FlowControlSettings.newBuilder()
-              .setMaxOutstandingRequestBytes(maxOutstandingRequestBytes)
-              .setMaxOutstandingElementCount(maxOutstandingMessages)
-              .setLimitExceededBehavior(FlowController.LimitExceededBehavior.Block)
-              .build());
+        return ByteString.EMPTY;
     }
 
-    com.google.cloud.pubsub.v1.Publisher.Builder builder =
-        com.google.cloud.pubsub.v1.Publisher.newBuilder(fullTopic)
-            .setCredentialsProvider(gcpCredentialsProvider)
-            .setBatchingSettings(batchingSettings.build())
-            .setRetrySettings(
-                RetrySettings.newBuilder()
-                    // All values that are not configurable come from the defaults for the publisher
-                    // client library.
-                    .setTotalTimeout(Duration.ofMillis(maxTotalTimeoutMs))
-                    .setMaxRpcTimeout(Duration.ofMillis(maxRequestTimeoutMs))
-                    .setInitialRetryDelay(Duration.ofMillis(5))
-                    .setRetryDelayMultiplier(2)
-                    .setMaxRetryDelay(Duration.ofMillis(Long.MAX_VALUE))
-                    .setInitialRpcTimeout(Duration.ofSeconds(10))
-                    .setRpcTimeoutMultiplier(2)
-                    .build())
-            .setExecutorProvider(FixedExecutorProvider.create(getSystemExecutor()))
-            .setEndpoint(cpsEndpoint);
-    if (orderingKeySource != OrderingKeySource.NONE) {
-      builder.setEnableMessageOrdering(true);
-    }
-    if (enableCompression) {
-      builder.setEnableCompression(true);
-      builder.setCompressionBytesThreshold(compressionBytesThreshold);
-    }
-    try {
-      publisher = builder.build();
-    } catch (Exception e) {
-      throw new RuntimeException(e);
-    }
-  }
-
-  private boolean useFlowControl() {
-    // only enable flow control if at least one flow control config has been set
-    return maxOutstandingRequestBytes
-            != CloudPubSubSinkConnector.DEFAULT_MAX_OUTSTANDING_REQUEST_BYTES
-        || maxOutstandingRequestBytes != CloudPubSubSinkConnector.DEFAULT_MAX_OUTSTANDING_MESSAGES;
-  }
-
-  @Override
-  public void stop() {
-    log.info("Stopping CloudPubSubSinkTask");
-
-    if (publisher != null) {
-      log.info("Shutting down PubSub publisher");
-      try {
-        publisher.shutdown();
-        boolean terminated =
-            publisher.awaitTermination(maxShutdownTimeoutMs, TimeUnit.MILLISECONDS);
-        if (!terminated) {
-          log.warn(
-              String.format(
-                  "PubSub publisher did not terminate cleanly in %d ms", maxShutdownTimeoutMs));
+    @Override
+    public void flush(Map<TopicPartition, OffsetAndMetadata> partitionOffsets) {
+        log.debug("Flushing...");
+        // Process results of all the outstanding futures specified by each TopicPartition.
+        for (Map.Entry<TopicPartition, OffsetAndMetadata> partitionOffset :
+                partitionOffsets.entrySet()) {
+            log.trace("Received flush for partition " + partitionOffset.getKey().toString());
+            Map<Integer, OutstandingFuturesForPartition> outstandingFuturesForTopic =
+                    allOutstandingFutures.get(partitionOffset.getKey().topic());
+            if (outstandingFuturesForTopic == null) {
+                continue;
+            }
+            OutstandingFuturesForPartition outstandingFutures =
+                    outstandingFuturesForTopic.get(partitionOffset.getKey().partition());
+            if (outstandingFutures == null) {
+                continue;
+            }
+            try {
+                ApiFutures.allAsList(outstandingFutures.futures).get();
+            } catch (Exception e) {
+                reconMaps.clear();
+                log.info("ReconMap size: {}", reconMaps.size());
+                throw new RuntimeException(e);
+            } finally {
+                outstandingFutures.futures.clear();
+            }
         }
-      } catch (Exception e) {
-        // There is not much we can do here besides logging it as an error
-        log.error("An exception occurred while shutting down PubSub publisher", e);
-      }
+
+        /** Introduced for the Juniper reconciliation  **/
+        if (reconEnabled) {
+            if (this.reconMaps.size() != 0) {
+                Iterator<Map.Entry<String, ArrayList<Reconciliation>>> it = reconMaps.entrySet().iterator();
+                while (it.hasNext()) {
+                    StringBuilder records = new StringBuilder();
+                    Map.Entry<String, ArrayList<Reconciliation>> pair = it.next();
+                    log.info("creating recon file for {}", pair.getKey().toString());
+                    ArrayList<Reconciliation> reconList = pair.getValue();
+                    for (int i = reconList.size() - 1; i >= 0; --i) {
+                        Reconciliation reconObject = reconList.get(i);
+                        String record =
+                                reconObject.getKafka_topic() + ","
+                                        +reconObject.getKafka_partition() + ","
+                                        +reconObject.getKafkaoffset() + ","
+                                        +reconObject.getKafkaTimeStamp() + ","
+                                        +reconObject.getPublishTimeStamp() + ","
+                                        +reconObject.getChangeSequence() + ","
+                                        +reconObject.getStreamPos() + ","
+                                        +reconObject.getTransactionId();
+                        records.append(record);
+                        records.append(System.getProperty("line.separator"));
+                    }
+                    log.info("file created for {}", pair.getKey().toString());
+                    createReconFile(pair.getKey().toString(), records);
+                    it.remove();
+                }
+            }
+        }
+        allOutstandingFutures.clear();
     }
-  }
+
+    /**  Introduced for Juniper Reconciliation **/
+    private void createReconFile(String topicPartition, StringBuilder records) {
+        Date date = new Date();
+        SimpleDateFormat sdf = new SimpleDateFormat("MM-dd-yyyy-HH-mm");
+        String strDate = sdf.format(date);
+        String reconFile = kafkaReconFilePath + "kConnect^^" + this.kConnectHostname + "^^" + this.feedSequence + "^^" + topicPartition + "^^" + strDate + ".recon";
+        try (BufferedWriter bw = new BufferedWriter(new FileWriter(reconFile, true));){
+            bw.append(records);
+            bw.flush();
+            bw.close();
+        }
+        catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    /** Publish all the messages in a partition and store the Future's for each publish request. */
+    private void publishMessage(String topic, Integer partition, PubsubMessage message) {
+        addPendingMessageFuture(topic, partition, publisher.publish(message));
+    }
+
+    private void addPendingMessageFuture(String topic, Integer partition, ApiFuture<String> future) {
+        // Get a map containing all futures per partition for the passed in topic.
+        Map<Integer, OutstandingFuturesForPartition> outstandingFuturesForTopic =
+                allOutstandingFutures.get(topic);
+        if (outstandingFuturesForTopic == null) {
+            outstandingFuturesForTopic = new HashMap<>();
+            allOutstandingFutures.put(topic, outstandingFuturesForTopic);
+        }
+        // Get the object containing the outstanding futures for this topic and partition..
+        OutstandingFuturesForPartition outstandingFutures = outstandingFuturesForTopic.get(partition);
+        if (outstandingFutures == null) {
+            outstandingFutures = new OutstandingFuturesForPartition();
+            outstandingFuturesForTopic.put(partition, outstandingFutures);
+        }
+        outstandingFutures.futures.add(future);
+    }
+
+    private void createPublisher() {
+        ProjectTopicName fullTopic = ProjectTopicName.of(cpsProject, cpsTopic);
+
+        BatchingSettings.Builder batchingSettings =
+                BatchingSettings.newBuilder()
+                        .setDelayThreshold(Duration.ofMillis(maxDelayThresholdMs))
+                        .setElementCountThreshold(maxBufferSize)
+                        .setRequestByteThreshold(maxBufferBytes);
+
+        if (useFlowControl()) {
+            batchingSettings.setFlowControlSettings(
+                    FlowControlSettings.newBuilder()
+                            .setMaxOutstandingRequestBytes(maxOutstandingRequestBytes)
+                            .setMaxOutstandingElementCount(maxOutstandingMessages)
+                            .setLimitExceededBehavior(FlowController.LimitExceededBehavior.Block)
+                            .build());
+        }
+
+        com.google.cloud.pubsub.v1.Publisher.Builder builder =
+                com.google.cloud.pubsub.v1.Publisher.newBuilder(fullTopic)
+                        .setCredentialsProvider(gcpCredentialsProvider)
+                        .setBatchingSettings(batchingSettings.build())
+                        .setRetrySettings(
+                                RetrySettings.newBuilder()
+                                        // All values that are not configurable come from the defaults for the publisher
+                                        // client library.
+                                        .setTotalTimeout(Duration.ofMillis(maxTotalTimeoutMs))
+                                        .setMaxRpcTimeout(Duration.ofMillis(maxRequestTimeoutMs))
+                                        .setInitialRetryDelay(Duration.ofMillis(5))
+                                        .setRetryDelayMultiplier(2)
+                                        .setMaxRetryDelay(Duration.ofMillis(Long.MAX_VALUE))
+                                        .setInitialRpcTimeout(Duration.ofSeconds(10))
+                                        .setRpcTimeoutMultiplier(2)
+                                        .build())
+                        .setExecutorProvider(FixedExecutorProvider.create(getSystemExecutor()))
+                        .setEndpoint(cpsEndpoint);
+        if (orderingKeySource != OrderingKeySource.NONE) {
+            builder.setEnableMessageOrdering(true);
+        }
+        if (enableCompression) {
+            builder.setEnableCompression(true);
+            builder.setCompressionBytesThreshold(compressionBytesThreshold);
+        }
+        try {
+            publisher = builder.build();
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private boolean useFlowControl() {
+        // only enable flow control if at least one flow control config has been set
+        return maxOutstandingRequestBytes
+                != CloudPubSubSinkConnector.DEFAULT_MAX_OUTSTANDING_REQUEST_BYTES
+                || maxOutstandingRequestBytes != CloudPubSubSinkConnector.DEFAULT_MAX_OUTSTANDING_MESSAGES;
+    }
+
+    @Override
+    public void stop() {
+        log.info("Stopping CloudPubSubSinkTask");
+
+        if (publisher != null) {
+            log.info("Shutting down PubSub publisher");
+            try {
+                publisher.shutdown();
+                boolean terminated =
+                        publisher.awaitTermination(maxShutdownTimeoutMs, TimeUnit.MILLISECONDS);
+                if (!terminated) {
+                    log.warn(
+                            String.format(
+                                    "PubSub publisher did not terminate cleanly in %d ms", maxShutdownTimeoutMs));
+                }
+            } catch (Exception e) {
+                // There is not much we can do here besides logging it as an error
+                log.error("An exception occurred while shutting down PubSub publisher", e);
+            }
+        }
+    }
+
 }
