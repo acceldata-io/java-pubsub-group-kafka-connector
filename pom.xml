@@ -100,6 +100,7 @@
         <dependency>
             <groupId>com.google.protobuf</groupId>
             <artifactId>protobuf-java</artifactId>
+            <version>3.25.5</version>
         </dependency>
         <dependency>
             <groupId>org.apache.kafka</groupId>
@@ -180,6 +181,7 @@
         <dependency>
             <groupId>com.google.protobuf</groupId>
             <artifactId>protobuf-java-util</artifactId>
+            <version>3.25.5</version>
             <exclusions>
                 <exclusion>
                     <groupId>com.google.guava</groupId>
@@ -338,6 +340,12 @@
                   </exclude>
                 </excludes>
               </artifactSet>
+              <relocations>
+                <relocation>
+                  <pattern>com.google.protobuf</pattern>
+                  <shadedPattern>com.google.pubsub.kafka.shaded.com.google.protobuf</shadedPattern>
+                </relocation>
+              </relocations>
               <transformers>
                 <transformer
                     implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
@@ -367,7 +375,7 @@
             protobuf-java version that grpc depends on.
           -->
           <protocArtifact>
-            com.google.protobuf:protoc:3.11.4:exe:${os.detected.classifier}
+            com.google.protobuf:protoc:3.25.5:exe:${os.detected.classifier}
           </protocArtifact>
           <pluginId>grpc-java</pluginId>
           <pluginArtifact>
