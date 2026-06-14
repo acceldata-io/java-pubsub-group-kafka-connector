@@ -354,7 +354,7 @@ public class CloudPubSubSourceTask extends SourceTask {
   }
 
   @Override
-  public void commitRecord(SourceRecord record) {
+  public void commitRecord(SourceRecord record, RecordMetadata metadata) {
     String ackId = record.sourceOffset().get(cpsSubscription.toString()).toString();
     ApiFutures.catching(
         subscriber.ackMessages(ImmutableList.of(ackId)),
@@ -365,10 +365,5 @@ public class CloudPubSubSourceTask extends SourceTask {
         },
         MoreExecutors.directExecutor());
     log.trace("Committed {}", ackId);
-  }
-
-  @Override
-  public void commitRecord(SourceRecord record, RecordMetadata metadata) {
-    this.commitRecord(record);
   }
 }

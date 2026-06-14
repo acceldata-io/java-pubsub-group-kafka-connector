@@ -32,6 +32,7 @@ import com.google.common.collect.Iterators;
 import com.google.common.collect.ListMultimap;
 import com.google.protobuf.ByteString;
 import java.util.List;
+import java.util.Optional;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
@@ -109,12 +110,12 @@ public class PollerImplTest {
             example(Offset.class).value(),
             1000L,
             TimestampType.NO_TIMESTAMP_TYPE,
-            0L,
             key.size(),
             value.size(),
             key.toByteArray(),
             value.toByteArray(),
-            mockHeaders);
+            mockHeaders,
+            Optional.empty());
     when(underlying.poll(PollerImpl.POLL_DURATION))
         .thenReturn(
             new ConsumerRecords<>(
@@ -176,11 +177,12 @@ public class PollerImplTest {
             example(Offset.class).value(),
             1000L,
             TimestampType.NO_TIMESTAMP_TYPE,
-            0L,
             key.size(),
             value.size(),
             key.toByteArray(),
-            value.toByteArray());
+            value.toByteArray(),
+            new org.apache.kafka.common.header.internals.RecordHeaders(),
+            Optional.empty());
     when(underlying.poll(PollerImpl.POLL_DURATION))
         .thenReturn(
             new ConsumerRecords<>(

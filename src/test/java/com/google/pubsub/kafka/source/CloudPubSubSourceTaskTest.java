@@ -136,7 +136,7 @@ public class CloudPubSubSourceTaskTest {
     when(subscriber.pull().get()).thenReturn(ImmutableList.of(rm1));
     List<SourceRecord> result = task.poll();
     assertEquals(1, result.size());
-    task.commitRecord(result.get(0));
+    task.commitRecord(result.get(0), null);
     SettableApiFuture<Empty> goodFuture = SettableApiFuture.create();
     goodFuture.set(Empty.getDefaultInstance());
     when(subscriber.ackMessages(any())).thenReturn(goodFuture);
