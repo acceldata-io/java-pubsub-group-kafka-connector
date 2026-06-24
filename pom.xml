@@ -23,7 +23,21 @@
     <maven.compiler.target>1.8</maven.compiler.target>
 
     <kafka.version>3.4.0</kafka.version>
+
   </properties>
+
+  <distributionManagement>
+    <repository>
+      <id>nexus-releases</id>
+      <name>Releases</name>
+      <url>https://repo1.acceldata.dev/repository/odp-staging-release/</url>
+    </repository>
+    <snapshotRepository>
+      <id>nexus-snapshots</id>
+      <name>Snapshot</name>
+      <url>https://repo1.acceldata.dev/repository/odp-staging-snapshot/</url>
+    </snapshotRepository>
+  </distributionManagement>
 
     <dependencyManagement>
         <dependencies>
@@ -315,6 +329,17 @@
       </plugins>
     </pluginManagement>
     <plugins>
+      <!-- Disable clirr: binary API checking is not applicable to a shaded uber jar -->
+      <plugin>
+        <groupId>org.codehaus.mojo</groupId>
+        <artifactId>clirr-maven-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>default</id>
+            <phase>none</phase>
+          </execution>
+        </executions>
+      </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-shade-plugin</artifactId>
